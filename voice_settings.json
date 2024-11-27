@@ -1,0 +1,8 @@
+{
+    "prompt": "You are a helpful and engaging AI assistant. Respond conversationally and be concise.",
+    "voice": "onyx",
+    "temperature": 0.7,
+    "emotion": "empathetic",
+    "speech_rate": 1.4,
+    "volume": 1.0
+}
