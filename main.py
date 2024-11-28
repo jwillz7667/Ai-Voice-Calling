@@ -1,20 +1,22 @@
 import os
-import sys
 import json
-import base64
 import asyncio
-import argparse
-from fastapi import FastAPI, WebSocket, BackgroundTasks
-from fastapi.responses import JSONResponse
-from fastapi.websockets import WebSocketDisconnect
+import re
+import ssl
+from fastapi import FastAPI, WebSocket, Request
+from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from twilio.rest import Client
 import aiohttp
 from dotenv import load_dotenv
 import uvicorn
-import re
-import threading
 import logging
 import traceback
+import httpx
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from pathlib import Path
 
 # Configure logging
 logging.basicConfig(
@@ -25,8 +27,10 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Load environment variables from .env file
-# Specify the path to the .env file relative to the project root
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+if not os.path.exists(dotenv_path):
+    logger.error(f".env file not found at {dotenv_path}")
+    exit(1)
 load_dotenv(dotenv_path)
 
 # Configuration with fallback values
@@ -34,8 +38,7 @@ TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID', '')
 TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN', '')
 PHONE_NUMBER_FROM = os.getenv('PHONE_NUMBER_FROM', '')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', '')
-raw_domain = os.getenv('DOMAIN', '')
-DOMAIN = re.sub(r'(^\w+:|^)\/\/|\/+$', '', raw_domain)  # Strip protocols and trailing slashes from DOMAIN
+DOMAIN = re.sub(r'(^\w+:|^)\/\/|\/+$', '', os.getenv('DOMAIN', ''))
 
 PORT = int(os.getenv('PORT', 6060))
 SYSTEM_MESSAGE = (
@@ -53,99 +56,146 @@ LOG_EVENT_TYPES = [
 
 app = FastAPI()
 
-# Modify the environment variable check to be more flexible
-def validate_env_vars():
-    missing_vars = []
-    if not TWILIO_ACCOUNT_SID:
-        missing_vars.append('TWILIO_ACCOUNT_SID')
-    if not TWILIO_AUTH_TOKEN:
-        missing_vars.append('TWILIO_AUTH_TOKEN')
-    if not PHONE_NUMBER_FROM:
-        missing_vars.append('PHONE_NUMBER_FROM')
-    if not OPENAI_API_KEY:
-        missing_vars.append('OPENAI_API_KEY')
-    
-    return missing_vars
+# Add CORS middleware configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # More permissive for testing
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Add TrustedHost middleware
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["*"]  # More permissive for testing
+)
+
+# Mount static files and templates
+app.mount("/static", StaticFiles(directory="static"), name="static")
+templates = Jinja2Templates(directory="templates")
+
+# Define root route
+@app.get("/")
+async def root(request: Request):
+    try:
+        logger.info("Serving root page")
+        return templates.TemplateResponse(
+            "index.html", 
+            {
+                "request": request,
+                "debug": True
+            }
+        )
+    except Exception as e:
+        logger.error(f"Error serving root page: {e}")
+        logger.error(traceback.format_exc())
+        return HTMLResponse(content="Server Error", status_code=500)
 
 # Lazy initialization of Twilio client
 def get_twilio_client():
-    """Initialize and return Twilio client, handling potential errors."""
+    """Initialize and return Twilio client with HTTP/2 support."""
     try:
-        # Ensure all required environment variables are present
         if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, PHONE_NUMBER_FROM]):
             logger.error("Missing Twilio credentials. Check your .env file.")
             return None
         
-        # Initialize Twilio client
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        # Create custom HTTP client with HTTP/2 support
+        http_client = httpx.Client(http2=True)
+        
+        # Initialize Twilio client with custom HTTP client
+        client = Client(
+            TWILIO_ACCOUNT_SID, 
+            TWILIO_AUTH_TOKEN,
+            http_client=http_client
+        )
         return client
     except Exception as e:
         logger.error(f"Error initializing Twilio client: {e}")
+        logger.error(traceback.format_exc())
         return None
 
 # Initialize Twilio client only when needed
 twilio_client = None
 
-@app.get('/', response_class=JSONResponse)
-async def index_page():
-    return {"message": "Twilio Media Stream Server is running!"}
-
 @app.websocket('/media-stream')
 async def handle_media_stream(websocket: WebSocket):
-    """Handle WebSocket connections between Twilio and OpenAI."""
-    await websocket.accept()
-    logger.info("WebSocket connection accepted")
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "OpenAI-Beta": "realtime=v1"
-    }
-
+    """Enhanced WebSocket connection handling with SSL/TLS configuration."""
     try:
+        await websocket.accept()
+        logger.info("WebSocket connection accepted")
+
+        # Configure SSL context for OpenAI connection
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE  # For testing only - remove in production
+
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "realtime=v1",
+            "Content-Type": "application/json",
+            "Connection": "Upgrade",
+            "Upgrade": "websocket"
+        }
+
         async with aiohttp.ClientSession() as session:
             async with session.ws_connect(
                 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
                 headers=headers,
-                heartbeat=30
+                ssl=ssl_context,
+                heartbeat=30,
+                timeout=aiohttp.ClientTimeout(total=60)
             ) as openai_ws:
-                logger.info("Connected to OpenAI WebSocket")
+                logger.info("Successfully connected to OpenAI WebSocket")
                 
-                # Initialize session
-                await openai_ws.send_json({
-                    "type": "session.update",
-                    "session": {
-                        "input_audio_format": "g711_ulaw",
-                        "output_audio_format": "g711_ulaw",
-                        "voice": VOICE,
-                        "instructions": SYSTEM_MESSAGE,
-                        "modalities": ["text", "audio"]
-                    }
-                })
-                logger.info(f"Session initialized with voice: {VOICE}")
+                # Comprehensive session initialization
+                await initialize_session(openai_ws)
+                logger.info("Advanced session configuration completed")
 
                 stream_sid = None
+                audio_buffer = []  # Accumulate audio chunks
 
                 async def receive_from_twilio():
-                    nonlocal stream_sid
+                    nonlocal stream_sid, audio_buffer
                     try:
                         async for message in websocket.iter_text():
-                            data = json.loads(message)
-                            
-                            if data['event'] == 'start':
-                                stream_sid = data['start']['streamSid']
-                                logger.info(f"Stream started: {stream_sid}")
-                            
-                            elif data['event'] == 'media':
-                                await openai_ws.send_json({
-                                    "type": "input_audio_buffer.append",
-                                    "audio": data['media']['payload']
-                                })
-                                await openai_ws.send_json({
-                                    "type": "input_audio_buffer.commit"
-                                })
+                            try:
+                                data = json.loads(message)
+                                
+                                if data['event'] == 'start':
+                                    stream_sid = data['start']['streamSid']
+                                    logger.info(f"Stream started: {stream_sid}")
+                                
+                                elif data['event'] == 'media':
+                                    # More robust audio chunk handling
+                                    audio_chunk = data['media']['payload']
+                                    
+                                    # Log audio chunk details
+                                    logger.debug(f"Received audio chunk: {len(audio_chunk)} bytes")
+                                    
+                                    audio_buffer.append(audio_chunk)
+                                    
+                                    # More flexible buffer management
+                                    if len(audio_buffer) >= 3 or len(''.join(audio_buffer)) > 1024:
+                                        combined_audio = ''.join(audio_buffer)
+                                        logger.info(f"Sending audio buffer: {len(combined_audio)} bytes")
+                                        
+                                        await openai_ws.send_json({
+                                            "type": "input_audio_buffer.append",
+                                            "audio": combined_audio
+                                        })
+                                        await openai_ws.send_json({
+                                            "type": "input_audio_buffer.commit"
+                                        })
+                                        
+                                        audio_buffer = []  # Reset buffer
+                        
+                            except json.JSONDecodeError:
+                                logger.warning("Received invalid JSON from Twilio")
                     
                     except Exception as e:
-                        logger.error(f"Error receiving from Twilio: {e}")
+                        logger.error(f"Error in Twilio message processing: {e}")
+                        logger.error(traceback.format_exc())
 
                 async def send_to_twilio():
                     try:
@@ -154,8 +204,9 @@ async def handle_media_stream(websocket: WebSocket):
                                 response = json.loads(msg.data)
                                 logger.debug(f"Received from OpenAI: {response.get('type')}")
                                 
-                                if response['type'] == 'response.audio.delta' and response.get('delta'):
-                                    if stream_sid:
+                                # More comprehensive response handling
+                                if response['type'] in ['response.audio.delta', 'response.content']:
+                                    if stream_sid and response.get('delta'):
                                         await websocket.send_json({
                                             "event": "media",
                                             "streamSid": stream_sid,
@@ -163,18 +214,26 @@ async def handle_media_stream(websocket: WebSocket):
                                                 "payload": response['delta']
                                             }
                                         })
+                                
+                                # Log other interesting response types for debugging
+                                elif response['type'] in LOG_EVENT_TYPES:
+                                    logger.info(f"Interesting event: {response}")
                     
                     except Exception as e:
                         logger.error(f"Error sending to Twilio: {e}")
+                        logger.error(traceback.format_exc())
 
-                # Run tasks concurrently
+                # Run tasks concurrently with error handling
                 await asyncio.gather(
                     receive_from_twilio(),
                     send_to_twilio()
                 )
 
     except Exception as e:
-        logger.error(f"WebSocket connection error: {e}")
+        logger.error(f"WebSocket error: {e}")
+        logger.error(traceback.format_exc())
+        if not websocket.client_state.is_disconnected:
+            await websocket.close(code=1011)  # Internal error
 
 async def initialize_session(openai_ws):
     """Advanced session initialization for hyper-realistic voice interaction."""
@@ -248,7 +307,7 @@ async def initialize_session(openai_ws):
             }
         })
         logger.info("Nuanced conversation context established")
-
+    
         # Initial Conversation Priming
         await openai_ws.send_json({
             "type": "conversation.item.create",
@@ -264,7 +323,7 @@ async def initialize_session(openai_ws):
             }
         })
         logger.info("Conversation primed with contextual instructions")
-
+    
         # Advanced Response Generation
         await openai_ws.send_json({
             "type": "response.create",
@@ -279,48 +338,10 @@ async def initialize_session(openai_ws):
             }
         })
         logger.info("Advanced response generation configured")
-
+    
     except Exception as e:
         logger.error(f"Advanced session initialization error: {e}")
         logger.error(traceback.format_exc())
-
-async def send_initial_conversation_item(openai_ws):
-    """Enhanced initial conversation setup."""
-    initial_conversation_setup = [
-        {
-            "type": "conversation.context.set",
-            "context": {
-                "domain": "general",
-                "tone": "conversational",
-                "formality_level": 0.5  # Balanced formality
-            }
-        },
-        {
-            "type": "conversation.item.create",
-            "item": {
-                "type": "message",
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": "Initiate a natural, engaging conversation. Start with a greeting and be prepared to discuss various topics dynamically."
-                    }
-                ]
-            }
-        },
-        {
-            "type": "response.create",
-            "config": {
-                "max_tokens": 100,  # Limit initial response length
-                "stream": True      # Enable streaming response
-            }
-        }
-    ]
-    
-    # Send each configuration item sequentially
-    for item in initial_conversation_setup:
-        await openai_ws.send_json(item)
-        await asyncio.sleep(0.1)  # Small delay between configurations
 
 async def make_call(
     phone_number: str, 
@@ -332,172 +353,168 @@ async def make_call(
     volume: float = 1.0
 ):
     """Enhanced call configuration with advanced parameters."""
-    # Ensure Twilio client is initialized
     global twilio_client
     if twilio_client is None:
         twilio_client = get_twilio_client()
     
-    # Check if client initialization was successful
     if twilio_client is None:
         logger.error("Failed to initialize Twilio client. Cannot make call.")
         return
 
-    # Emotion-based system message customization
-    emotion_configs = {
-        'neutral': {
-            'temperature': 0.5,
-            'top_p': 0.8,
-            'frequency_penalty': 0.3,
-            'presence_penalty': 0.2
-        },
-        'friendly': {
-            'temperature': 0.7,
-            'top_p': 0.9,
-            'frequency_penalty': 0.4,
-            'presence_penalty': 0.5
-        },
-        'professional': {
-            'temperature': 0.4,
-            'top_p': 0.7,
-            'frequency_penalty': 0.2,
-            'presence_penalty': 0.1
-        },
-        'enthusiastic': {
-            'temperature': 0.8,
-            'top_p': 0.9,
-            'frequency_penalty': 0.5,
-            'presence_penalty': 0.6
-        },
-        'empathetic': {
-            'temperature': 0.6,
-            'top_p': 0.8,
-            'frequency_penalty': 0.3,
-            'presence_penalty': 0.4
-        },
-        'playful': {
-            'temperature': 0.9,
-            'top_p': 0.9,
-            'frequency_penalty': 0.6,
-            'presence_penalty': 0.7
-        }
-    }
-
-    # Apply emotion-specific configurations
-    emotion_config = emotion_configs.get(emotion, emotion_configs['neutral'])
+    # Construct WebSocket URL with explicit protocol and path
+    ws_url = f"wss://{DOMAIN}/media-stream"
     
-    # Update global variables with emotion-specific settings
-    global SYSTEM_MESSAGE, VOICE
-    SYSTEM_MESSAGE = (
-        f"You are in a {emotion} conversational mode. "
-        f"{prompt or 'Engage in a natural, dynamic conversation.'}"
-    )
-    VOICE = voice
-
-    # Ensure compliance with applicable laws and regulations
+    # Create properly formatted TwiML with explicit WebSocket configuration
     outbound_twiml = (
-        f'<?xml version="1.0" encoding="UTF-8"?>'
-        f'<Response><Connect><Stream url="wss://{DOMAIN}/media-stream" /></Connect></Response>'
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<Response>'
+        '<Connect>'
+        f'<Stream url="{ws_url}">'
+        '<Parameter name="protocol" value="wss"/>'
+        '<Parameter name="encryption" value="tls"/>'
+        '<Parameter name="client" value="twilio"/>'
+        '</Stream>'
+        '</Connect>'
+        '</Response>'
     )
 
     try:
+        logger.info(f"Initiating call to {phone_number} with WebSocket URL: {ws_url}")
         call = twilio_client.calls.create(
             from_=PHONE_NUMBER_FROM,
             to=phone_number,
-            twiml=outbound_twiml
+            twiml=outbound_twiml,
+            timeout=60,
+            trim='trim-silence',
+            caller_id=PHONE_NUMBER_FROM,
+            record=False,
+            status_callback=f"https://{DOMAIN}/call-status",
+            status_callback_event=['initiated', 'ringing', 'answered', 'completed'],
+            status_callback_method='POST'
         )
-
+        
+        logger.info(f"Call initiated with SID: {call.sid}")
         await log_call_sid(call.sid)
+        return call.sid
     except Exception as e:
         logger.error(f"Error creating Twilio call: {e}")
-        # Optionally, you can add more specific error handling here
+        logger.error(traceback.format_exc())
+        raise
 
 async def log_call_sid(call_sid):
     """Log the call SID."""
     print(f"Call started with SID: {call_sid}")
 
-def run_make_call(phone_number):
-    """Run the make_call coroutine in a new event loop."""
-    new_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(new_loop)
-    new_loop.run_until_complete(make_call(phone_number))
-    new_loop.close()
+@app.post("/call-status")
+async def call_status(request: Request):
+    form_data = await request.form()
+    logger.info(f"Call status update: {dict(form_data)}")
+    return {"status": "received"}
 
-def initiate_call(phone_number, config):
-    """
-    Initiate a call with the specified configuration
-    """
-    # Your existing call logic here, using config["voice"] and config["prompt"]
-    pass
-
-def set_system_message(new_message):
-    """Update the global system message."""
-    global SYSTEM_MESSAGE
-    SYSTEM_MESSAGE = new_message
-
-def set_voice(new_voice):
-    """Update the global voice."""
-    global VOICE
-    VOICE = new_voice
-
-def launch_gui():
-    """Launch the GUI from main.py without circular import"""
-    import importlib
-    gui_module = importlib.import_module('gui')
-    gui_module.main()
-
-if __name__ == "__main__":
-    # Check if a call argument is provided
-    parser = argparse.ArgumentParser(description="Run the Twilio AI voice assistant.")
-    parser.add_argument('--call', help="The phone number to call, e.g., '--call=+18005551212'")
-    parser.add_argument('--config', help="Path to JSON configuration file")
-    args = parser.parse_args()
-
-    # If a call number is provided, proceed with call setup
-    if args.call:
-        # Explicitly initialize Twilio client before making the call
-        twilio_client = get_twilio_client()
-        if twilio_client is None:
-            print("Failed to initialize Twilio client. Check your credentials.")
-            sys.exit(1)
-
-        phone_number = args.call
-        
-        # Load configuration from file if provided
-        if args.config:
-            try:
-                with open(args.config, 'r') as f:
-                    config = json.load(f)
-                    
-                    # Override global variables with config
-                    if 'prompt' in config:
-                        set_system_message(config['prompt'])
-                    
-                    if 'voice' in config:
-                        set_voice(config['voice'])
-                    
-                    # Log the applied configuration
-                    print("Applied Configuration:")
-                    print(f"Prompt: {SYSTEM_MESSAGE}")
-                    print(f"Voice: {VOICE}")
-            except Exception as e:
-                print(f"Error loading configuration: {e}")
-
-        print(
-            'Our recommendation is to always disclose the use of AI for outbound or inbound calls.\n'
-            'Reminder: All of the rules of TCPA apply even if a call is made by AI.\n'
-            'Check with your counsel for legal and compliance advice.'
+@app.post("/make-call")
+async def api_make_call(request: Request):
+    try:
+        data = await request.json()
+        call_sid = await make_call(
+            phone_number=data['phone_number'],
+            voice=data.get('voice', 'alloy'),
+            prompt=data.get('prompt')
+        )
+        return {"status": "success", "call_sid": call_sid}
+    except Exception as e:
+        logger.error(f"Error in make_call API: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "error": str(e)}
         )
 
-        # Start the make_call coroutine in a separate thread
-        call_thread = threading.Thread(target=run_make_call, args=(phone_number,), daemon=True)
-        call_thread.start()
+@app.get("/debug")
+async def debug_info():
+    try:
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        template_dir = os.path.join(os.path.dirname(__file__), "templates")
+        
+        return {
+            "static_exists": os.path.exists(static_dir),
+            "static_files": os.listdir(static_dir) if os.path.exists(static_dir) else [],
+            "templates_exist": os.path.exists(template_dir),
+            "template_files": os.listdir(template_dir) if os.path.exists(template_dir) else [],
+            "current_dir": os.getcwd(),
+            "files_in_current_dir": os.listdir(".")
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
-        # Start the Uvicorn server
-        uvicorn.run(app, host="0.0.0.0", port=PORT)
+@app.get("/test")
+async def test_route():
+    return {
+        "status": "ok",
+        "static_dir": os.path.exists(os.path.join(os.path.dirname(__file__), "static")),
+        "templates_dir": os.path.exists(os.path.join(os.path.dirname(__file__), "templates")),
+        "message": "If you see this, the server is working!"
+    }
 
-        # Wait for the call_thread to finish
-        call_thread.join()
+def validate_configuration():
+    """Validate required environment variables and configuration."""
+    missing_vars = []
     
-    # If no call argument, launch the GUI
-    else:
-        launch_gui()
+    # Check required environment variables
+    if not TWILIO_ACCOUNT_SID:
+        missing_vars.append('TWILIO_ACCOUNT_SID')
+    if not TWILIO_AUTH_TOKEN:
+        missing_vars.append('TWILIO_AUTH_TOKEN')
+    if not PHONE_NUMBER_FROM:
+        missing_vars.append('PHONE_NUMBER_FROM')
+    if not OPENAI_API_KEY:
+        missing_vars.append('OPENAI_API_KEY')
+    if not DOMAIN:
+        missing_vars.append('DOMAIN')
+    
+    # If any required variables are missing, log and raise an error
+    if missing_vars:
+        error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
+    # Validate port number
+    if not isinstance(PORT, int) or PORT <= 0:
+        error_msg = f"Invalid PORT value: {PORT}. Must be a positive integer."
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+    
+    logger.info("Configuration validation successful")
+    return True
+
+if __name__ == "__main__":
+    logger.info("Starting Voice AI server...")
+    try:
+        validate_configuration()
+        logger.info(f"Server starting on port {PORT}")
+        logger.info(f"Static files directory: {os.path.join(os.path.dirname(__file__), 'static')}")
+        logger.info(f"Templates directory: {os.path.join(os.path.dirname(__file__), 'templates')}")
+        
+        # Check if directories exist
+        static_dir = os.path.join(os.path.dirname(__file__), "static")
+        template_dir = os.path.join(os.path.dirname(__file__), "templates")
+        
+        if not os.path.exists(static_dir):
+            logger.error(f"Static directory not found: {static_dir}")
+            os.makedirs(static_dir, exist_ok=True)
+            logger.info("Created static directory")
+            
+        if not os.path.exists(template_dir):
+            logger.error(f"Templates directory not found: {template_dir}")
+            os.makedirs(template_dir, exist_ok=True)
+            logger.info("Created templates directory")
+            
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",
+            port=PORT,
+            log_level="info",
+            proxy_headers=True,
+            forwarded_allow_ips="*"
+        )
+    except Exception as e:
+        logger.error(f"Failed to start server: {e}")
+        logger.error(traceback.format_exc())

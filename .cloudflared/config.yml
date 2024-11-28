@@ -1,0 +1,11 @@
+tunnel: voice-ai-tunnel
+credentials-file: /Users/willz/Desktop/AI-PROJECTS/crank/.cloudflared/1257a738-8745-4de7-8780-e171ba450ba8.json
+
+ingress:
+  - hostname: voice-ai.mobiledetailco.com
+    service: http://localhost:6060
+    originRequest:
+      noTLSVerify: true
+      connectTimeout: 30s
+      disableChunkedEncoding: true
+  - service: http_status:404 
